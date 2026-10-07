@@ -178,11 +178,17 @@ stage_inputs() {
         bash "$HERE/toolchain/rust.sh" > "$RUN/logs/rust.log" 2>&1 || { say "build/toolchain/rust.sh failed"; missing=1; }
     fi
     [ "$missing" = 0 ] || exit 1
-    # The Swift frontend needs the host's clang resource headers inside the SDK.
-    for d in /usr/lib/swift/lib/clang/*/include; do
+    # The Swift frontend needs its own clang's resource headers inside the SDK
+    # (lib/clang/<v>/include beside its runtime resource path: /usr/lib/swift/lib/swift
+    # for a distribution package, usr/lib/swift in a swiftly toolchain). A copy
+    # from another clang (the host LLVM's) fails in arm_neon.h, so compare them.
+    local swiftbin
+    swiftbin=$(swift_bin) || exit 1
+    for d in "$swiftbin"/../lib/clang/*/include; do
+        [ -d "$d" ] || { say "no clang resource headers in the Swift toolchain ($swiftbin/..)"; exit 1; }
         v=$(basename "$(dirname "$d")")
         inc=$DARWIN_SDK/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/$v/include
-        [ -f "$inc/arm_neon.h" ] ||
+        cmp -s "$d/arm_neon.h" "$inc/arm_neon.h" ||
             { say "copying clang $v resource headers into the SDK"; mkdir -p "$inc"; rsync -a --delete "$d/" "$inc/"; }
     done
     # iOS C++ compiles take the SDK's libc++ headers (build/lib.sh ios_cxx_stdlib):
@@ -368,13 +374,27 @@ stage_notices() {
     say "  $(tail -1 "$RUN/logs/notices.log")"
 }
 
+# swift_bin: the bin directory of the Swift toolchain that `swift` runs (its
+# clang is the one the Swift frontend's module builds match).
+swift_bin() {
+    local res
+    res=$(swift -print-target-info | python3 -c 'import json,sys; print(json.load(sys.stdin)["paths"]["runtimeResourcePath"])') ||
+        { say "swift -print-target-info failed"; return 1; }
+    realpath "$res/../../bin"
+}
+
 stage_app() {
     if [ "$VARIANT" = release ]; then
         run app python3 "$HERE/stages/stage-artifacts.py" release "$PKG"
         say "  $(tail -1 "$RUN/logs/app.log")"
     fi
     rm -f "$IPA"
-    (cd "$PKG" && PLAYPORT_VARIANT=$VARIANT SWIFTPM_CUSTOM_BIN_DIR=$HERE/ld64 "$XTOOL" dev build $SIGN --ipa) >> "$RUN/logs/app.log" 2>&1 ||
+    # xtool copies the resource headers of the first clang on PATH into the SDK
+    # (DarwinSDK addHostClangResourceDir): it must be the Swift toolchain's, not
+    # the host LLVM the trees build with.
+    local swiftbin
+    swiftbin=$(swift_bin) || exit 1
+    (cd "$PKG" && PATH="$swiftbin:$PATH" PLAYPORT_VARIANT=$VARIANT SWIFTPM_CUSTOM_BIN_DIR=$HERE/ld64 "$XTOOL" dev build $SIGN --ipa) >> "$RUN/logs/app.log" 2>&1 ||
         { say "FAILED: xtool dev build (log: $RUN/logs/app.log)"
           grep -E '(error|fatal error):' "$RUN/logs/app.log" | sed 's/\x1b\[[0-9;]*m//g' | sort -u | head -20 >&2
           echo "--- last lines of $RUN/logs/app.log:" >&2; tail -25 "$RUN/logs/app.log" >&2; exit 1; }
